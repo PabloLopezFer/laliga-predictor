@@ -88,7 +88,11 @@ def calculate_btts_probability(lambda_home, lambda_away):
 def calculate_match_probabilities(lambda_home, lambda_away, max_goals=7):
     """
     Calcula probabilidades de victoria local, empate y victoria visitante
-    usando distribución de Poisson bivariada
+    usando distribución de Poisson con ajuste natural de incertidumbre
+    
+    El fútbol tiene incertidumbre inherente - aplicamos un factor de regresión
+    para reflejar que las diferencias extremas de calidad rara vez se traducen
+    en certezas del 100% (lesiones, suerte, errores arbitrales, etc.)
     
     Args:
         lambda_home: Goles esperados del equipo local
@@ -98,6 +102,30 @@ def calculate_match_probabilities(lambda_home, lambda_away, max_goals=7):
     Returns:
         dict con probabilidades de winHome, draw, winAway
     """
+    # AJUSTE NATURAL: Reducir diferencias extremas de lambdas
+    # En fútbol real, diferencias de calidad se ven reducidas por factores
+    # impredecibles (lesiones, suerte, motivación, etc.)
+    
+    # Calcular la diferencia de goles esperados
+    lambda_diff = abs(lambda_home - lambda_away)
+    
+    # Si la diferencia es muy grande (>3 goles), aplicar regresión a la media
+    # Esto refleja que en fútbol, las sorpresas pasan con más frecuencia
+    # de lo que predicen modelos puramente matemáticos
+    if lambda_diff > 3:
+        # Factor de regresión: cuanto mayor la diferencia, más regresión
+        regression_factor = 0.7  # 30% de regresión hacia la media
+        mean_lambda = (lambda_home + lambda_away) / 2
+        
+        lambda_home = lambda_home * regression_factor + mean_lambda * (1 - regression_factor)
+        lambda_away = lambda_away * regression_factor + mean_lambda * (1 - regression_factor)
+    
+    # Añadir "ruido de incertidumbre" - el fútbol no es 100% predecible
+    # Esto aumenta ligeramente ambos lambdas para reflejar varianza
+    uncertainty_factor = 0.15
+    lambda_home += uncertainty_factor
+    lambda_away += uncertainty_factor
+    
     prob_home_win = 0
     prob_draw = 0
     prob_away_win = 0
@@ -122,15 +150,15 @@ def calculate_match_probabilities(lambda_home, lambda_away, max_goals=7):
         prob_draw = (prob_draw / total) * 100
         prob_away_win = (prob_away_win / total) * 100
     
-    # Asegurar que sumen exactamente 100
+    # Redondear y asegurar que sumen exactamente 100
     prob_home_win = round(prob_home_win)
     prob_draw = round(prob_draw)
     prob_away_win = 100 - prob_home_win - prob_draw
     
     return {
-        'winHome': max(0, min(100, prob_home_win)),
-        'draw': max(0, min(100, prob_draw)),
-        'winAway': max(0, min(100, prob_away_win))
+        'winHome': prob_home_win,
+        'draw': prob_draw,
+        'winAway': prob_away_win
     }
 
 def get_head_to_head_stats(home_api_name, away_api_name, all_matches, max_seasons_back=2):
