@@ -6,10 +6,11 @@ Sistema de análisis y predicción de partidos de LaLiga usando Inteligencia Art
 
 - 🤖 **Análisis con IA** - Predicciones con Claude AI usando datos estadísticos reales
 - 📊 **Datos en tiempo real** - API de football-data.org con estadísticas actualizadas
-- 📈 **Forma reciente** - Últimos 5 partidos de cada equipo
-- 🏠 **Rendimiento local/visitante** - Estadísticas específicas de cada equipo
-- 🎲 **Probabilidades** - Victoria local, empate, victoria visitante
-- ⚽ **Probabilidades de goles** - Over 0.5, 1.5, 2.5, 3.5 y ambos marcan
+- 📈 **Modelo Avanzado** - Poisson + Dixon-Coles + Regresión Logística Multinomial
+- 🏠 **Rendimiento local/visitante** - Estadísticas específicas separadas por ubicación
+- 🎲 **Probabilidades 1X2** - Victoria local, empate, victoria visitante (ajustadas con ML)
+- ⚽ **Probabilidades de goles** - Over 0.5, 1.5, 2.5, 3.5 y ambos marcan (Poisson)
+- 🎯 **xG Ponderado** - 50% temporada + 20% L5 específico + 20% L5 general + 10% L10
 - 🔄 **Actualización automática** - Se actualiza cada jornada automáticamente
 
 ## 🚀 Uso Local

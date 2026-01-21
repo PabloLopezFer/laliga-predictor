@@ -634,7 +634,7 @@ IMPORTANTE: Esto es una predicción estadística, no garantiza el resultado real
                         {/* NUEVO: Goles esperados con Poisson */}
                         {analysis.expectedGoals && (
                           <div className="bg-gradient-to-r from-cyan-900/40 to-blue-900/40 rounded-xl p-6 border border-cyan-500/30 mt-6">
-                            <h3 className="text-cyan-200 font-bold text-xl mb-4 text-center">🎯 Predicción de Goles (Modelo Poisson)</h3>
+                            <h3 className="text-cyan-200 font-bold text-xl mb-4 text-center">🎯 Predicción de Goles (Poisson + Dixon-Coles)</h3>
                             
                             <div className="grid grid-cols-3 gap-4 mb-4">
                               <div className="bg-black/30 rounded-lg p-4 text-center">
@@ -655,7 +655,7 @@ IMPORTANTE: Esto es una predicción estadística, no garantiza el resultado real
                             </div>
                             
                             <p className="text-cyan-200 text-xs text-center">
-                              📊 {analysis.poissonData?.dataSource || 'Calculado con distribución de Poisson basada en estadísticas reales de temporada'}
+                              📊 {analysis.poissonData?.dataSource || 'Calculado con Poisson + Dixon-Coles (corrige correlación en resultados bajos)'}
                             </p>
                           </div>
                         )}
@@ -663,7 +663,7 @@ IMPORTANTE: Esto es una predicción estadística, no garantiza el resultado real
                         {/* Probabilidades de goles */}
                         {(analysis.over05 !== undefined || analysis.btts !== undefined) && (
                           <div className="bg-gradient-to-r from-orange-900/40 to-red-900/40 rounded-xl p-6 border border-orange-500/30 mt-6">
-                            <h3 className="text-orange-200 font-bold text-xl mb-4 text-center">⚽ Probabilidades de Goles {analysis.poissonData ? '(Poisson + Histórico)' : ''}</h3>
+                            <h3 className="text-orange-200 font-bold text-xl mb-4 text-center">⚽ Probabilidades de Goles {analysis.poissonData ? '(Modelo Mejorado)' : ''}</h3>
                             
                             <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
                               {analysis.over05 !== undefined && (

@@ -6,6 +6,7 @@ import urllib.request
 import urllib.error
 import os
 import math
+import numpy as np
 
 # Cargar variables de entorno desde .env (solo en local)
 try:
@@ -29,6 +30,12 @@ if not API_KEY or not CLAUDE_API_KEY:
     print("Por favor, configura API_KEY y CLAUDE_API_KEY")
     print("Ver COMO_DESPLEGAR.md para instrucciones")
     exit(1)
+
+# Variables globales para modelo de regresión logística
+MODEL_WEIGHTS = None
+MODEL_BIAS = None
+MODEL_X_MEAN = None
+MODEL_X_STD = None
 
 # Mapeo de nombres
 NAME_MAP = {
@@ -85,72 +92,364 @@ def calculate_btts_probability(lambda_home, lambda_away):
     prob_away_scores = 1 - poisson_probability(0, lambda_away)
     return max(0, min(100, prob_home_scores * prob_away_scores * 100))
 
-def calculate_match_probabilities(lambda_home, lambda_away, max_goals=7):
+def dixon_coles_tau(x, y, lambda_home, lambda_away, rho=-0.13):
     """
-    Calcula probabilidades de victoria local, empate y victoria visitante
-    usando distribución de Poisson con ajuste natural de incertidumbre
+    Función tau (τ) de Dixon-Coles para corregir la correlación entre goles.
     
-    El fútbol tiene incertidumbre inherente - aplicamos un factor de regresión
-    para reflejar que las diferencias extremas de calidad rara vez se traducen
-    en certezas del 100% (lesiones, suerte, errores arbitrales, etc.)
+    Dixon-Coles corrige el modelo de Poisson independiente que subestima
+    la probabilidad de empates 0-0 y sobrestima otros resultados bajos.
+    
+    La función tau ajusta las probabilidades solo para resultados bajos:
+    - (0,0): equipos sin marcar están correlacionados
+    - (1,0), (0,1): un equipo marca, otro no
+    - (1,1): ambos marcan exactamente 1 gol
     
     Args:
-        lambda_home: Goles esperados del equipo local
-        lambda_away: Goles esperados del equipo visitante
-        max_goals: Máximo de goles a considerar en los cálculos (default 7)
+        x: Goles del equipo local
+        y: Goles del equipo visitante  
+        lambda_home: xG del equipo local
+        lambda_away: xG del equipo visitante
+        rho: Parámetro de correlación (típicamente entre -0.15 y -0.10)
+             Valor negativo indica que marcar reduce probabilidad del rival
     
     Returns:
-        dict con probabilidades de winHome, draw, winAway
+        float: Factor de ajuste tau (τ)
     """
-    # AJUSTE NATURAL: Reducir diferencias extremas de lambdas
-    # En fútbol real, diferencias de calidad se ven reducidas por factores
-    # impredecibles (lesiones, suerte, motivación, etc.)
+    # Para resultados altos (x > 1 o y > 1), no hay ajuste
+    if x > 1 or y > 1:
+        return 1.0
     
-    # Calcular la diferencia de goles esperados
-    lambda_diff = abs(lambda_home - lambda_away)
+    # Ajustes para resultados bajos (basados en Dixon & Coles 1997)
+    if x == 0 and y == 0:
+        # 0-0: Ambos equipos sin marcar (correlación negativa fuerte)
+        return 1.0 - lambda_home * lambda_away * rho
+    elif x == 0 and y == 1:
+        # 0-1: Local no marca, visitante marca 1
+        return 1.0 + lambda_home * rho
+    elif x == 1 and y == 0:
+        # 1-0: Local marca 1, visitante no marca
+        return 1.0 + lambda_away * rho
+    elif x == 1 and y == 1:
+        # 1-1: Ambos marcan exactamente 1 gol
+        return 1.0 - rho
     
-    # Si la diferencia es muy grande (>3 goles), aplicar regresión a la media
-    # Esto refleja que en fútbol, las sorpresas pasan con más frecuencia
-    # de lo que predicen modelos puramente matemáticos
-    if lambda_diff > 3:
-        # Factor de regresión: cuanto mayor la diferencia, más regresión
-        regression_factor = 0.7  # 30% de regresión hacia la media
-        mean_lambda = (lambda_home + lambda_away) / 2
+    return 1.0
+
+
+# ============================================================================
+# SEGUNDA CAPA: REGRESIÓN LOGÍSTICA MULTINOMIAL
+# ============================================================================
+
+def softmax(z):
+    """Función softmax para convertir logits en probabilidades"""
+    exp_z = np.exp(z - np.max(z))  # Restar max para estabilidad numérica
+    return exp_z / np.sum(exp_z)
+
+
+def train_logistic_regression(all_matches, max_iterations=100, learning_rate=0.01):
+    """
+    Entrena un modelo de regresión logística multinomial con partidos históricos.
+    
+    IMPORTANTE: Usa la MISMA fórmula de xG que en predicción real:
+    - 50% temporada completa (local/visitante específico)
+    - 20% últimos 5 partidos (local/visitante específico)
+    - 20% últimos 5 partidos en general
+    - 10% últimos 10 partidos en general
+    
+    Features (X):
+    - xG local
+    - xG visitante
+    - Diferencia xG (local - visitante)
+    - Prob Poisson victoria local
+    - Prob Poisson empate
+    - Prob Poisson victoria visitante
+    
+    Target (y):
+    - 0 = Victoria local
+    - 1 = Empate
+    - 2 = Victoria visitante
+    
+    Returns:
+        weights: Matriz de pesos (features x 3 clases)
+        bias: Vector de sesgos (3 clases)
+    """
+    X_list = []
+    y_list = []
+    
+    # Ordenar partidos por fecha
+    all_matches_sorted = sorted(all_matches, key=lambda x: x['utcDate'], reverse=True)
+    
+    # Preparar datos de entrenamiento
+    for i, match in enumerate(all_matches):
+        home_name = match['homeTeam']['name']
+        away_name = match['awayTeam']['name']
+        home_score = match['score']['fullTime']['home']
+        away_score = match['score']['fullTime']['away']
         
+        # Obtener partidos históricos ANTES de este partido (para evitar data leakage)
+        historical_matches = [m for m in all_matches_sorted if m['utcDate'] > match['utcDate']]
+        
+        if len(historical_matches) < 10:
+            continue  # Necesitamos suficiente historial
+        
+        # Calcular xG usando LA MISMA FÓRMULA que en producción
+        home_matches_all = [m for m in historical_matches if m['homeTeam']['name'] == home_name or m['awayTeam']['name'] == home_name]
+        away_matches_all = [m for m in historical_matches if m['homeTeam']['name'] == away_name or m['awayTeam']['name'] == away_name]
+        
+        home_as_home_all = [m for m in historical_matches if m['homeTeam']['name'] == home_name]
+        away_as_away_all = [m for m in historical_matches if m['awayTeam']['name'] == away_name]
+        
+        # xG LOCAL (misma fórmula que producción)
+        xg_temp_casa = sum(m['score']['fullTime']['home'] for m in home_as_home_all) / len(home_as_home_all) if home_as_home_all else 1.0
+        xg_l5_casa = sum(m['score']['fullTime']['home'] for m in home_as_home_all[:5]) / min(len(home_as_home_all[:5]), 5) if home_as_home_all[:5] else xg_temp_casa
+        xg_l5_gen_h = sum(m['score']['fullTime']['home'] if m['homeTeam']['name'] == home_name else m['score']['fullTime']['away'] for m in home_matches_all[:5]) / min(len(home_matches_all[:5]), 5) if home_matches_all[:5] else xg_temp_casa
+        xg_l10_gen_h = sum(m['score']['fullTime']['home'] if m['homeTeam']['name'] == home_name else m['score']['fullTime']['away'] for m in home_matches_all[:10]) / min(len(home_matches_all[:10]), 10) if home_matches_all[:10] else xg_temp_casa
+        
+        xg_home = xg_temp_casa * 0.50 + xg_l5_casa * 0.20 + xg_l5_gen_h * 0.20 + xg_l10_gen_h * 0.10
+        
+        # xG VISITANTE (misma fórmula que producción)
+        xg_temp_fuera = sum(m['score']['fullTime']['away'] for m in away_as_away_all) / len(away_as_away_all) if away_as_away_all else 1.0
+        xg_l5_fuera = sum(m['score']['fullTime']['away'] for m in away_as_away_all[:5]) / min(len(away_as_away_all[:5]), 5) if away_as_away_all[:5] else xg_temp_fuera
+        xg_l5_gen_a = sum(m['score']['fullTime']['home'] if m['homeTeam']['name'] == away_name else m['score']['fullTime']['away'] for m in away_matches_all[:5]) / min(len(away_matches_all[:5]), 5) if away_matches_all[:5] else xg_temp_fuera
+        xg_l10_gen_a = sum(m['score']['fullTime']['home'] if m['homeTeam']['name'] == away_name else m['score']['fullTime']['away'] for m in away_matches_all[:10]) / min(len(away_matches_all[:10]), 10) if away_matches_all[:10] else xg_temp_fuera
+        
+        xg_away = xg_temp_fuera * 0.50 + xg_l5_fuera * 0.20 + xg_l5_gen_a * 0.20 + xg_l10_gen_a * 0.10
+        
+        # Calcular probabilidades Poisson base
+        poisson_probs = calculate_match_probabilities(xg_home, xg_away, use_dixon_coles=True)
+        
+        # Features
+        features = [
+            xg_home,
+            xg_away,
+            xg_home - xg_away,  # Diferencia
+            poisson_probs['winHome'] / 100,  # Normalizar a [0,1]
+            poisson_probs['draw'] / 100,
+            poisson_probs['winAway'] / 100
+        ]
+        
+        # Target
+        if home_score > away_score:
+            target = 0  # Victoria local
+        elif home_score == away_score:
+            target = 1  # Empate
+        else:
+            target = 2  # Victoria visitante
+        
+        X_list.append(features)
+        y_list.append(target)
+    
+    X = np.array(X_list)
+    y = np.array(y_list)
+    
+    # Normalizar features
+    X_mean = np.mean(X, axis=0)
+    X_std = np.std(X, axis=0) + 1e-8  # Evitar división por 0
+    X_normalized = (X - X_mean) / X_std
+    
+    # Inicializar pesos
+    n_features = X.shape[1]
+    n_classes = 3
+    weights = np.zeros((n_features, n_classes))
+    bias = np.zeros(n_classes)
+    
+    # Entrenamiento con descenso de gradiente
+    for iteration in range(max_iterations):
+        # Forward pass
+        logits = np.dot(X_normalized, weights) + bias
+        probs = np.apply_along_axis(softmax, 1, logits)
+        
+        # Crear one-hot encoding del target
+        y_one_hot = np.zeros((len(y), n_classes))
+        y_one_hot[np.arange(len(y)), y] = 1
+        
+        # Gradientes
+        error = probs - y_one_hot
+        grad_weights = np.dot(X_normalized.T, error) / len(X)
+        grad_bias = np.mean(error, axis=0)
+        
+        # Actualizar pesos
+        weights -= learning_rate * grad_weights
+        bias -= learning_rate * grad_bias
+    
+    return weights, bias, X_mean, X_std
+
+
+def initialize_logistic_model():
+    """
+    Carga y entrena el modelo de regresión logística con datos históricos.
+    Se ejecuta la primera vez que se necesita una predicción.
+    """
+    global MODEL_WEIGHTS, MODEL_BIAS, MODEL_X_MEAN, MODEL_X_STD
+    
+    if MODEL_WEIGHTS is not None:
+        return  # Ya está entrenado
+    
+    print("🔄 Entrenando modelo de regresión logística...")
+    
+    try:
+        # Obtener partidos finalizados
+        req = urllib.request.Request(
+            'https://api.football-data.org/v4/competitions/PD/matches?status=FINISHED',
+            headers={'X-Auth-Token': API_KEY}
+        )
+        
+        with urllib.request.urlopen(req) as response:
+            all_matches = json.loads(response.read())['matches']
+            
+            # Entrenar modelo
+            MODEL_WEIGHTS, MODEL_BIAS, MODEL_X_MEAN, MODEL_X_STD = train_logistic_regression(all_matches)
+            
+            print(f"✅ Modelo entrenado con {len(all_matches)} partidos")
+    except Exception as e:
+        print(f"⚠️ No se pudo entrenar modelo de regresión: {e}")
+        print("   Usando solo Poisson + Dixon-Coles")
+
+
+def predict_with_logistic(xg_home, xg_away, poisson_probs, weights, bias, X_mean, X_std, max_deviation=8):
+    """
+    Predice probabilidades 1X2 usando regresión logística entrenada con límite de ajuste.
+    
+    RESTRICCIÓN CLAVE: La regresión NO puede cambiar más de ±max_deviation% 
+    respecto a las probabilidades base de Poisson. Esto evita que invierta 
+    completamente al favorito cuando los xG son similares.
+    
+    Args:
+        xg_home: xG del equipo local
+        xg_away: xG del equipo visitante
+        poisson_probs: Dict con probabilidades de Poisson/Dixon-Coles
+        weights: Matriz de pesos del modelo
+        bias: Vector de sesgos
+        X_mean: Media de features (normalización)
+        X_std: Desviación estándar de features
+        max_deviation: Máximo cambio permitido en puntos porcentuales (default 8%)
+    
+    Returns:
+        dict: {winHome, draw, winAway} ajustadas por regresión (limitadas)
+    """
+    # Construir features
+    features = np.array([
+        xg_home,
+        xg_away,
+        xg_home - xg_away,
+        poisson_probs['winHome'] / 100,
+        poisson_probs['draw'] / 100,
+        poisson_probs['winAway'] / 100
+    ])
+    
+    # Normalizar
+    features_normalized = (features - X_mean) / X_std
+    
+    # Predecir con regresión
+    logits = np.dot(features_normalized, weights) + bias
+    probs = softmax(logits)
+    
+    # Convertir a porcentajes
+    lr_win_home = probs[0] * 100
+    lr_draw = probs[1] * 100
+    lr_win_away = probs[2] * 100
+    
+    # LIMITAR el ajuste respecto a Poisson base
+    poisson_win_home = poisson_probs['winHome']
+    poisson_draw = poisson_probs['draw']
+    poisson_win_away = poisson_probs['winAway']
+    
+    # Calcular ajustes limitados
+    adjusted_win_home = np.clip(lr_win_home, poisson_win_home - max_deviation, poisson_win_home + max_deviation)
+    adjusted_draw = np.clip(lr_draw, poisson_draw - max_deviation, poisson_draw + max_deviation)
+    adjusted_win_away = np.clip(lr_win_away, poisson_win_away - max_deviation, poisson_win_away + max_deviation)
+    
+    # Normalizar para que sumen 100% exacto
+    total = adjusted_win_home + adjusted_draw + adjusted_win_away
+    adjusted_win_home = (adjusted_win_home / total) * 100
+    adjusted_draw = (adjusted_draw / total) * 100
+    adjusted_win_away = (adjusted_win_away / total) * 100
+    
+    # Redondear
+    win_home = round(adjusted_win_home)
+    draw = round(adjusted_draw)
+    win_away = 100 - win_home - draw  # Asegurar suma exacta de 100
+    
+    return {
+        'winHome': win_home,
+        'draw': draw,
+        'winAway': win_away
+    }
+
+
+def calculate_match_probabilities(lambda_home, lambda_away, max_goals=7, use_dixon_coles=True):
+    """
+    Calcula probabilidades 1X2 usando Poisson extendido con Dixon-Coles.
+    
+    MODELO BASE: Distribución de Poisson bivariada
+    - Asume independencia entre goles de cada equipo
+    - P(x,y) = P(x) × P(y) donde x=goles local, y=goles visitante
+    
+    EXTENSIÓN DIXON-COLES:
+    - Corrige la correlación entre goles para resultados bajos
+    - P(x,y) = τ(x,y) × P(x) × P(y)
+    - τ(x,y) es el factor de ajuste que corrige la interdependencia
+    
+    AJUSTES ADICIONALES:
+    - Regresión a la media para diferencias extremas (>3 goles)
+    - Factor de incertidumbre (+0.15) para reflejar varianza real
+    
+    Args:
+        lambda_home: Goles esperados (xG) del equipo local
+        lambda_away: Goles esperados (xG) del equipo visitante
+        max_goals: Máximo de goles a considerar (default 7)
+        use_dixon_coles: Si True, aplica corrección Dixon-Coles
+    
+    Returns:
+        dict: {winHome, draw, winAway} en porcentajes (suman 100%)
+    """
+    # PASO 1: Ajuste de regresión para diferencias extremas
+    lambda_diff = abs(lambda_home - lambda_away)
+    if lambda_diff > 3:
+        regression_factor = 0.7
+        mean_lambda = (lambda_home + lambda_away) / 2
         lambda_home = lambda_home * regression_factor + mean_lambda * (1 - regression_factor)
         lambda_away = lambda_away * regression_factor + mean_lambda * (1 - regression_factor)
     
-    # Añadir "ruido de incertidumbre" - el fútbol no es 100% predecible
-    # Esto aumenta ligeramente ambos lambdas para reflejar varianza
+    # PASO 2: Factor de incertidumbre (varianza)
     uncertainty_factor = 0.15
     lambda_home += uncertainty_factor
     lambda_away += uncertainty_factor
     
-    prob_home_win = 0
-    prob_draw = 0
-    prob_away_win = 0
+    # PASO 3: Calcular matriz de probabilidades
+    prob_home_win = 0.0
+    prob_draw = 0.0
+    prob_away_win = 0.0
     
-    # Calcular todas las combinaciones de resultados posibles
     for home_goals in range(max_goals + 1):
         for away_goals in range(max_goals + 1):
-            # Probabilidad de este resultado exacto
-            prob = poisson_probability(home_goals, lambda_home) * poisson_probability(away_goals, lambda_away)
+            # Probabilidad base de Poisson (independiente)
+            prob_poisson = poisson_probability(home_goals, lambda_home) * \
+                          poisson_probability(away_goals, lambda_away)
             
-            if home_goals > away_goals:
-                prob_home_win += prob
-            elif home_goals == away_goals:
-                prob_draw += prob
+            # Aplicar Dixon-Coles solo si está activado
+            if use_dixon_coles:
+                tau = dixon_coles_tau(home_goals, away_goals, lambda_home, lambda_away)
+                prob_final = tau * prob_poisson
             else:
-                prob_away_win += prob
+                prob_final = prob_poisson
+            
+            # Acumular en categorías 1X2
+            if home_goals > away_goals:
+                prob_home_win += prob_final
+            elif home_goals == away_goals:
+                prob_draw += prob_final
+            else:
+                prob_away_win += prob_final
     
-    # Normalizar para que sumen 100%
+    # PASO 4: Normalizar para que sumen 100%
     total = prob_home_win + prob_draw + prob_away_win
     if total > 0:
         prob_home_win = (prob_home_win / total) * 100
         prob_draw = (prob_draw / total) * 100
         prob_away_win = (prob_away_win / total) * 100
     
-    # Redondear y asegurar que sumen exactamente 100
+    # PASO 5: Redondear y ajustar para suma exacta de 100
     prob_home_win = round(prob_home_win)
     prob_draw = round(prob_draw)
     prob_away_win = 100 - prob_home_win - prob_draw
@@ -616,80 +915,44 @@ class Handler(SimpleHTTPRequestHandler):
                         away_pos = standings_data.get(away_api_name, {}).get('position', 10)
                         away_pts = standings_data.get(away_api_name, {}).get('points', 30)
                         
-                        # Calcular estadísticas de goles para ambos equipos con ponderación temporal
-                        # Usa toda la temporada: 40% últimos 3 + 30% siguientes 5 + 30% resto
-                        home_stats_specific = get_goal_statistics(home_api_name, all_matches, use_weighted=True)
-                        away_stats_specific = get_goal_statistics(away_api_name, all_matches, use_weighted=True)
+                        # CÁLCULO DE xG CON PESOS ESPECÍFICOS
+                        # Ordenar por fecha (más recientes primero)
+                        all_matches_sorted = sorted(all_matches, key=lambda x: x['utcDate'], reverse=True)
                         
-                        # GENERALES (forma reciente global) - últimos 5 partidos en total
-                        home_matches_all = [m for m in all_matches if m['homeTeam']['name'] == home_api_name or m['awayTeam']['name'] == home_api_name][:5]
-                        away_matches_all = [m for m in all_matches if m['homeTeam']['name'] == away_api_name or m['awayTeam']['name'] == away_api_name][:5]
+                        # Filtrar partidos por equipo
+                        home_matches_all = [m for m in all_matches_sorted if m['homeTeam']['name'] == home_api_name or m['awayTeam']['name'] == home_api_name]
+                        away_matches_all = [m for m in all_matches_sorted if m['homeTeam']['name'] == away_api_name or m['awayTeam']['name'] == away_api_name]
                         
-                        # Calcular promedio de goles de forma general
-                        home_gf_general = sum(m['score']['fullTime']['home'] if m['homeTeam']['name'] == home_api_name 
-                                            else m['score']['fullTime']['away'] for m in home_matches_all) if home_matches_all else 0
-                        home_gc_general = sum(m['score']['fullTime']['away'] if m['homeTeam']['name'] == home_api_name 
-                                            else m['score']['fullTime']['home'] for m in home_matches_all) if home_matches_all else 0
+                        home_as_home_all = [m for m in all_matches_sorted if m['homeTeam']['name'] == home_api_name]
+                        away_as_away_all = [m for m in all_matches_sorted if m['awayTeam']['name'] == away_api_name]
                         
-                        away_gf_general = sum(m['score']['fullTime']['home'] if m['homeTeam']['name'] == away_api_name 
-                                            else m['score']['fullTime']['away'] for m in away_matches_all) if away_matches_all else 0
-                        away_gc_general = sum(m['score']['fullTime']['away'] if m['homeTeam']['name'] == away_api_name 
-                                            else m['score']['fullTime']['home'] for m in away_matches_all) if away_matches_all else 0
+                        # xG_LOCAL = 50% temporada casa + 20% L5 casa + 20% L5 general + 10% L10 general
+                        xg_temp_casa = sum(m['score']['fullTime']['home'] for m in home_as_home_all) / len(home_as_home_all) if home_as_home_all else 0
+                        xg_l5_casa = sum(m['score']['fullTime']['home'] for m in home_as_home_all[:5]) / min(len(home_as_home_all[:5]), 5) if home_as_home_all[:5] else 0
+                        xg_l5_gen_h = sum(m['score']['fullTime']['home'] if m['homeTeam']['name'] == home_api_name else m['score']['fullTime']['away'] for m in home_matches_all[:5]) / min(len(home_matches_all[:5]), 5) if home_matches_all[:5] else 0
+                        xg_l10_gen_h = sum(m['score']['fullTime']['home'] if m['homeTeam']['name'] == home_api_name else m['score']['fullTime']['away'] for m in home_matches_all[:10]) / min(len(home_matches_all[:10]), 10) if home_matches_all[:10] else 0
                         
-                        home_avg_scored_general = home_gf_general / len(home_matches_all) if home_matches_all else 0
-                        home_avg_conceded_general = home_gc_general / len(home_matches_all) if home_matches_all else 0
-                        away_avg_scored_general = away_gf_general / len(away_matches_all) if away_matches_all else 0
-                        away_avg_conceded_general = away_gc_general / len(away_matches_all) if away_matches_all else 0
+                        lambda_home = xg_temp_casa * 0.50 + xg_l5_casa * 0.20 + xg_l5_gen_h * 0.20 + xg_l10_gen_h * 0.10
                         
-                        # Promedio de la liga
-                        total_goals = sum(m['score']['fullTime']['home'] + m['score']['fullTime']['away'] for m in all_matches)
-                        league_avg = total_goals / (2 * len(all_matches)) if all_matches else 1.4
+                        # xG_VISITANTE = 50% temporada fuera + 20% L5 fuera + 20% L5 general + 10% L10 general
+                        xg_temp_fuera = sum(m['score']['fullTime']['away'] for m in away_as_away_all) / len(away_as_away_all) if away_as_away_all else 0
+                        xg_l5_fuera = sum(m['score']['fullTime']['away'] for m in away_as_away_all[:5]) / min(len(away_as_away_all[:5]), 5) if away_as_away_all[:5] else 0
+                        xg_l5_gen_a = sum(m['score']['fullTime']['home'] if m['homeTeam']['name'] == away_api_name else m['score']['fullTime']['away'] for m in away_matches_all[:5]) / min(len(away_matches_all[:5]), 5) if away_matches_all[:5] else 0
+                        xg_l10_gen_a = sum(m['score']['fullTime']['home'] if m['homeTeam']['name'] == away_api_name else m['score']['fullTime']['away'] for m in away_matches_all[:10]) / min(len(away_matches_all[:10]), 10) if away_matches_all[:10] else 0
                         
-                        # Calcular lambdas con ENFOQUE HÍBRIDO
-                        # 65% peso a estadísticas local/visitante específicas + 35% a forma general reciente
-                        
-                        # Lambda basado en local/visitante
-                        lambda_home_specific = (home_stats_specific['asHome']['avgScored'] * away_stats_specific['asAway']['avgConceded']) / league_avg
-                        lambda_away_specific = (away_stats_specific['asAway']['avgScored'] * home_stats_specific['asHome']['avgConceded']) / league_avg
-                        
-                        # Lambda basado en forma general
-                        lambda_home_general = (home_avg_scored_general * away_avg_conceded_general) / league_avg
-                        lambda_away_general = (away_avg_scored_general * home_avg_conceded_general) / league_avg
-                        
-                        # COMBINACIÓN PONDERADA BASE: 65% específico + 35% general
-                        lambda_home_base = lambda_home_specific * 0.65 + lambda_home_general * 0.35
-                        lambda_away_base = lambda_away_specific * 0.65 + lambda_away_general * 0.35
-                        
-                        # ===== NUEVO: HISTORIAL DIRECTO (H2H) =====
-                        h2h_stats = get_head_to_head_stats(home_api_name, away_api_name, all_matches, max_seasons_back=2)
-                        
-                        # Si existe historial directo, calcularlo y aplicar un peso del 20%
-                        if h2h_stats['h2hExists'] and h2h_stats['matches'] >= 2:
-                            lambda_home_h2h = h2h_stats['homeAvgScored']
-                            lambda_away_h2h = h2h_stats['awayAvgScored']
-                            h2h_weight = 0.20  # 20% peso al H2H
-                            
-                            # Combinar: 80% modelo base + 20% H2H
-                            lambda_home_with_h2h = lambda_home_base * (1 - h2h_weight) + lambda_home_h2h * h2h_weight
-                            lambda_away_with_h2h = lambda_away_base * (1 - h2h_weight) + lambda_away_h2h * h2h_weight
-                        else:
-                            # Sin H2H suficiente, usar solo el modelo base
-                            lambda_home_with_h2h = lambda_home_base
-                            lambda_away_with_h2h = lambda_away_base
-                        
-                        # ===== NUEVO: FACTOR DE CALIDAD DEL RIVAL =====
-                        # Calcula cómo la calidad del rival afecta la capacidad de marcar
-                        home_quality_factor = calculate_opponent_quality_factor(home_pos, home_pts, away_pos, away_pts)
-                        away_quality_factor = calculate_opponent_quality_factor(away_pos, away_pts, home_pos, home_pts)
-                        
-                        # Aplicar factores de calidad (ajusta los goles esperados según la fuerza del rival)
-                        lambda_home = lambda_home_with_h2h * home_quality_factor
-                        lambda_away = lambda_away_with_h2h * away_quality_factor
+                        lambda_away = xg_temp_fuera * 0.50 + xg_l5_fuera * 0.20 + xg_l5_gen_a * 0.20 + xg_l10_gen_a * 0.10
                         lambda_total = lambda_home + lambda_away
                         
-                        # Información adicional para debugging
-                        h2h_info = f"H2H: {h2h_stats['matches']} partidos" if h2h_stats['h2hExists'] else "Sin H2H"
-                        quality_info = f"Factor calidad: {home_quality_factor:.2f}/{away_quality_factor:.2f}"
+                        # Para mostrar stats
+                        home_stats_specific = get_goal_statistics(home_api_name, all_matches, use_weighted=False)
+                        away_stats_specific = get_goal_statistics(away_api_name, all_matches, use_weighted=False)
+                        h2h_stats = get_head_to_head_stats(home_api_name, away_api_name, all_matches, max_seasons_back=2)
+                        
+                        # Info para logs  
+                        total_goles_home = sum(m['score']['fullTime']['home'] for m in home_as_home_all[:5]) if home_as_home_all[:5] else 0
+                        total_goles_away = sum(m['score']['fullTime']['away'] for m in away_as_away_all[:5]) if away_as_away_all[:5] else 0
+                        h2h_info = f"xG ponderado: {lambda_home:.2f}/{lambda_away:.2f}"
+                        quality_info = f"(50% temp + 20% L5 esp + 20% L5 gen + 10% L10 gen)"
                         
                         # Usar home_stats_specific y away_stats_specific para el resto
                         home_stats = home_stats_specific
@@ -720,8 +983,22 @@ class Handler(SimpleHTTPRequestHandler):
                         final_over35 = round(poisson_over35 * 0.7 + hist_over35 * 0.3)
                         final_btts = round(poisson_btts * 0.7 + hist_btts * 0.3)
                         
-                        # ===== NUEVO: CALCULAR PROBABILIDADES DE VICTORIA CON POISSON =====
-                        match_probs = calculate_match_probabilities(lambda_home, lambda_away)
+                        # ===== CAPA 1: CALCULAR PROBABILIDADES CON POISSON + DIXON-COLES =====
+                        match_probs_base = calculate_match_probabilities(lambda_home, lambda_away)
+                        
+                        # ===== CAPA 2: AJUSTAR CON REGRESIÓN LOGÍSTICA (SI ESTÁ DISPONIBLE) =====
+                        initialize_logistic_model()  # Entrenar si es la primera vez
+                        
+                        if MODEL_WEIGHTS is not None:
+                            # Usar regresión logística para ajustar probabilidades
+                            match_probs = predict_with_logistic(
+                                lambda_home, lambda_away, match_probs_base,
+                                MODEL_WEIGHTS, MODEL_BIAS, MODEL_X_MEAN, MODEL_X_STD
+                            )
+                            print(f"   📈 Ajustado con regresión: {match_probs_base['winHome']}%→{match_probs['winHome']}% | {match_probs_base['draw']}%→{match_probs['draw']}% | {match_probs_base['winAway']}%→{match_probs['winAway']}%")
+                        else:
+                            # Fallback: usar solo Poisson + Dixon-Coles
+                            match_probs = match_probs_base
                         
                         # ===== GENERAR REASONING BASADO EN DATOS REALES (NO IA) =====
                         reasoning = {
@@ -746,7 +1023,7 @@ class Handler(SimpleHTTPRequestHandler):
                             reasoning['awayAdvantages'].append(f"Ataque efectivo fuera: {away_stats['asAway']['avgScored']} goles/partido vs {home_stats['asHome']['avgConceded']} recibidos por rival")
                         if away_pos < home_pos:
                             reasoning['awayAdvantages'].append(f"Mejor posición en clasificación ({away_pos}º vs {home_pos}º)")
-                        if away_stats['asAway']['avgConceded'] < league_avg:
+                        if away_stats['asAway']['avgConceded'] < 1.5:
                             reasoning['awayAdvantages'].append(f"Defensa sólida fuera: solo {away_stats['asAway']['avgConceded']} goles recibidos/partido")
                         
                         # Factores clave del partido
@@ -788,13 +1065,9 @@ class Handler(SimpleHTTPRequestHandler):
                                 'home': home_stats,
                                 'away': away_stats
                             },
-                            'method': 'Modelo Profesional con Ponderación Temporal',
-                            'dataSource': f'Flujo: 📊 Ponderación temporal (40% últimos 3 + 30% sig.5 + 30% resto) → 🏠 Local (65%) + 📈 Forma (35%) → +🔄 H2H (20% si existe) → ×⚖️ Ajuste calidad rival (0.85-1.15)',
-                            'h2hData': h2h_stats,
-                            'qualityFactors': {
-                                'home': round(home_quality_factor, 2),
-                                'away': round(away_quality_factor, 2)
-                            }
+                            'method': 'Modelo Simplificado - Forma Reciente Pura',
+                            'dataSource': 'Flujo: 📊 Solo últimos 5 partidos → Lambda directo = goles/5',
+                            'h2hData': h2h_stats
                         }
                         
                         self.wfile.write(json.dumps(result, ensure_ascii=False).encode('utf-8'))
