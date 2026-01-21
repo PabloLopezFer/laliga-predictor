@@ -137,13 +137,15 @@ def dixon_coles_tau(x, y, lambda_home, lambda_away, rho=-0.13):
 
 
 # ============================================================================
-# SEGUNDA CAPA: REGRESIÓN LOGÍSTICA MULTINOMIAL
+# SEGUNDA CAPA: REGRESIÓN LOGÍSTICA MULTINOMIAL (DESACTIVADA TEMPORALMENTE)
 # ============================================================================
+# NOTA: Esta capa está comentada mientras se hacen ajustes.
+# Actualmente solo se usa Poisson + Dixon-Coles.
 
-def softmax(z):
-    """Función softmax para convertir logits en probabilidades"""
-    exp_z = np.exp(z - np.max(z))  # Restar max para estabilidad numérica
-    return exp_z / np.sum(exp_z)
+# def softmax(z):
+#     """Función softmax para convertir logits en probabilidades"""
+#     exp_z = np.exp(z - np.max(z))  # Restar max para estabilidad numérica
+#     return exp_z / np.sum(exp_z)
 
 
 def train_logistic_regression(all_matches, max_iterations=100, learning_rate=0.01):
@@ -983,22 +985,19 @@ class Handler(SimpleHTTPRequestHandler):
                         final_over35 = round(poisson_over35 * 0.7 + hist_over35 * 0.3)
                         final_btts = round(poisson_btts * 0.7 + hist_btts * 0.3)
                         
-                        # ===== CAPA 1: CALCULAR PROBABILIDADES CON POISSON + DIXON-COLES =====
-                        match_probs_base = calculate_match_probabilities(lambda_home, lambda_away)
+                        # ===== SOLO POISSON + DIXON-COLES (Capa 2 temporalmente desactivada) =====
+                        match_probs = calculate_match_probabilities(lambda_home, lambda_away)
                         
-                        # ===== CAPA 2: AJUSTAR CON REGRESIÓN LOGÍSTICA (SI ESTÁ DISPONIBLE) =====
-                        initialize_logistic_model()  # Entrenar si es la primera vez
-                        
-                        if MODEL_WEIGHTS is not None:
-                            # Usar regresión logística para ajustar probabilidades
-                            match_probs = predict_with_logistic(
-                                lambda_home, lambda_away, match_probs_base,
-                                MODEL_WEIGHTS, MODEL_BIAS, MODEL_X_MEAN, MODEL_X_STD
-                            )
-                            print(f"   📈 Ajustado con regresión: {match_probs_base['winHome']}%→{match_probs['winHome']}% | {match_probs_base['draw']}%→{match_probs['draw']}% | {match_probs_base['winAway']}%→{match_probs['winAway']}%")
-                        else:
-                            # Fallback: usar solo Poisson + Dixon-Coles
-                            match_probs = match_probs_base
+                        # # ===== CAPA 2: REGRESIÓN LOGÍSTICA (DESACTIVADA) =====
+                        # initialize_logistic_model()  # Entrenar si es la primera vez
+                        # 
+                        # if MODEL_WEIGHTS is not None:
+                        #     # Usar regresión logística para ajustar probabilidades
+                        #     match_probs = predict_with_logistic(
+                        #         lambda_home, lambda_away, match_probs,
+                        #         MODEL_WEIGHTS, MODEL_BIAS, MODEL_X_MEAN, MODEL_X_STD
+                        #     )
+                        #     print(f"   📈 Ajustado con regresión: {match_probs['winHome']}% | {match_probs['draw']}% | {match_probs['winAway']}%")
                         
                         # ===== GENERAR REASONING BASADO EN DATOS REALES (NO IA) =====
                         reasoning = {
